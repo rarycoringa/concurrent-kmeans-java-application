@@ -1,4 +1,4 @@
-compile:
+build:
     mvn compile
 
 run: 
