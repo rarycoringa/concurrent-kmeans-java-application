@@ -1,5 +1,8 @@
-build:
-    mvn compile
+clean:
+    mvn --quiet clean
 
-run: 
-    mvn exec:java -Dexec.mainClass="kmeans.Main"
+build:
+    mvn --quiet compile
+
+run dataset_path:
+    mvn --quiet exec:java -Dexec.args="{{dataset_path}}"
