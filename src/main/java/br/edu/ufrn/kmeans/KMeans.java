@@ -93,7 +93,7 @@ public final class KMeans {
         return updated;
     }
 
-    private static int closestCentroid(double[] point, double[][] centroids) {
+    static int closestCentroid(double[] point, double[][] centroids) {
         int bestIndex = 0;
         double bestDistance = squaredDistance(point, centroids[0]);
 
@@ -109,7 +109,7 @@ public final class KMeans {
         return bestIndex;
     }
 
-    private static double squaredDistance(double[] left, double[] right) {
+    static double squaredDistance(double[] left, double[] right) {
         double total = 0.0d;
 
         for (int i = 0; i < left.length; i++) {

@@ -9,7 +9,7 @@ import java.util.logging.Logger;
 public final class Main {
 
     private static final int K = 10;
-    private static final int MAX_ITERATIONS = 20;
+    private static final int MAX_ITERATIONS = 10;
     private static final double TOLERANCE = 1.0e-6;
     private static final Logger logger = Logger.getLogger(Main.class.getName());
 
