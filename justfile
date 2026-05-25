@@ -47,3 +47,12 @@ profile-report:
         results/profile/concurrent.jfr > results/profile/threads.txt
     jfr print --events jdk.FileRead \
         results/profile/concurrent.jfr > results/profile/io.txt
+
+bench-stress-build:
+    mvn --quiet package -DskipTests
+
+bench-stress filter="JCS":
+    mkdir -p results/stress
+    java -jar target/kmeans-1.0-SNAPSHOT-stress.jar \
+        -t {{filter}} \
+        -r results/stress

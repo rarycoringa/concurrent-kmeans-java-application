@@ -15,4 +15,6 @@ data/
 
 results/
 
+META-INF/
+
 dependency-reduced-pom.xml
