@@ -23,7 +23,6 @@ bench-macro-deploy:
     mvn --quiet package -DskipTests
     cp target/kmeans-1.0-SNAPSHOT.jar /home/rarycoringa/university/concurrent/jmeter/lib/ext/
 
-
 bench-macro-g1:
     GC_ALGO="-XX:+UseG1GC" /home/rarycoringa/university/concurrent/jmeter/bin/jmeter
 
@@ -32,3 +31,19 @@ bench-macro-zgc:
 
 bench-macro-parallel:
     GC_ALGO="-XX:+UseParallelGC" /home/rarycoringa/university/concurrent/jmeter/bin/jmeter
+
+profile dataset_path:
+    mkdir -p results/profile
+    mvn --quiet exec:exec \
+        -Dexec.executable=java \
+        -Dexec.args="-XX:StartFlightRecording=name=serial,settings=profile,dumponexit=true,filename=results/profile/serial.jfr -cp %classpath br.edu.ufrn.kmeans.Main {{dataset_path}}"
+
+profile-report:
+    jfr print --events jdk.ExecutionSample \
+        results/profile/serial.jfr > results/profile/hot-methods.txt
+    jfr print --events jdk.GarbageCollection,jdk.GCHeapSummary \
+        results/profile/serial.jfr > results/profile/gc.txt
+    jfr print --events jdk.JavaThreadStatistics,jdk.ThreadCPULoad \
+        results/profile/serial.jfr > results/profile/threads.txt
+    jfr print --events jdk.FileRead \
+        results/profile/serial.jfr > results/profile/io.txt
