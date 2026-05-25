@@ -2,76 +2,167 @@ package br.edu.ufrn.kmeans;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.logging.Logger;
 
 public final class KMeans {
 
     private static final Logger logger = Logger.getLogger(KMeans.class.getName());
+    private static final int BATCH_SIZE = 5_000;
+
+    private record PartialResult(double[][] sums, long[] counts) {}
+    private record EvaluatePartial(long[] clusterSizes, double sumSquaredError) {}
 
     public static KMeansResult cluster(Path datasetPath, CsvDataset dataset, int k, int maxIterations, double tolerance) throws IOException {
         List<double[]> seeds = dataset.readInitialCentroids(datasetPath, k);
-
         logger.info("Initialized " + k + " centroids from the first rows of the dataset.");
 
-        double[][] centroids = new double[k][];
 
+        double[][] centroids = new double[k][];
+        
         for (int i = 0; i < k; i++) {
             centroids[i] = seeds.get(i).clone();
         }
 
+        int n = Runtime.getRuntime().availableProcessors();
+        ExecutorService executor = Executors.newFixedThreadPool(n, Thread.ofPlatform().factory());
         int completedIterations = 0;
 
-        for (int iteration = 1; iteration <= maxIterations; iteration++) {
-            int currentIteration = iteration;
+        try {
+            for (int iteration = 1; iteration <= maxIterations; iteration++) {
+                int currentIteration = iteration;
+                logger.info("Starting iteration " + currentIteration + " of " + maxIterations + ".");
 
-            logger.info("Starting iteration " + currentIteration + " of " + maxIterations + ".");
+                double[][] snapshot = copy(centroids);
+                List<Future<PartialResult>> futures = executor.invokeAll(buildAssignTasks(datasetPath, dataset, snapshot));
 
-            double[][] sums = new double[k][dataset.featureCount()];
-            long[] counts = new long[k];
-            double[][] activeCentroids = centroids;
+                double[][] sums = new double[k][dataset.featureCount()];
+                long[] counts = new long[k];
+                for (Future<PartialResult> f : futures) {
+                    PartialResult pr = f.get();
+                    for (int c = 0; c < k; c++) {
+                        counts[c] += pr.counts()[c];
+                        for (int d = 0; d < sums[c].length; d++)
+                            sums[c][d] += pr.sums()[c][d];
+                    }
+                }
 
-            dataset.forEachPoint(datasetPath, (point, rowNumber) -> {
-                int closest = closestCentroid(point, activeCentroids);
-                counts[closest]++;
-                addPoint(sums[closest], point);
-            });
+                double[][] updatedCentroids = recomputeCentroids(centroids, sums, counts);
+                completedIterations = iteration;
 
-            double[][] updatedCentroids = recomputeCentroids(centroids, sums, counts);
-            completedIterations = iteration;
+                double shift = maxShift(centroids, updatedCentroids);
+                logger.info("Finished iteration " + currentIteration + " with max centroid shift " + shift + ".");
 
-            double shift = maxShift(centroids, updatedCentroids);
-            double currentShift = shift;
-
-            logger.info("Finished iteration " + currentIteration + " with max centroid shift " + currentShift + ".");
-
-            if (shift <= tolerance) {
                 centroids = updatedCentroids;
 
-                logger.info("Converged at iteration " + currentIteration + ".");
-
-                break;
+                if (shift <= tolerance) {
+                    logger.info("Converged at iteration " + currentIteration + ".");
+                    break;
+                }
             }
 
-            centroids = updatedCentroids;
+            logger.info("Evaluating final clusters.");
+            return evaluate(datasetPath, dataset, centroids, completedIterations, executor);
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Clustering interrupted", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException ioe) throw ioe;
+            throw new IOException("Batch processing failed", cause);
+        } finally {
+            executor.shutdown();
         }
-
-        logger.info("Evaluating final clusters.");
-
-        return evaluate(datasetPath, dataset, centroids, completedIterations);
     }
 
-    private static KMeansResult evaluate(Path datasetPath, CsvDataset dataset, double[][] centroids, int iterations) throws IOException {
-        long[] clusterSizes = new long[centroids.length];
-        double[] sumSquaredError = new double[1];
+    private static List<Callable<PartialResult>> buildAssignTasks(Path datasetPath, CsvDataset dataset, double[][] snapshot) throws IOException {
+        List<Callable<PartialResult>> tasks = new ArrayList<>();
+        List<double[]> batch = new ArrayList<>(BATCH_SIZE);
 
         dataset.forEachPoint(datasetPath, (point, rowNumber) -> {
-            int closest = closestCentroid(point, centroids);
-            clusterSizes[closest]++;
-            sumSquaredError[0] += squaredDistance(point, centroids[closest]);
+            batch.add(point);
+            if (batch.size() == BATCH_SIZE) {
+                List<double[]> currentBatch = List.copyOf(batch);
+                tasks.add(() -> processAssignBatch(currentBatch, snapshot));
+                batch.clear();
+            }
         });
 
-        return new KMeansResult(copy(centroids), dataset.featureNames(), clusterSizes, iterations, sumSquaredError[0]);
+        if (!batch.isEmpty()) {
+            List<double[]> lastBatch = List.copyOf(batch);
+            tasks.add(() -> processAssignBatch(lastBatch, snapshot));
+        }
+
+        return tasks;
+    }
+
+    private static PartialResult processAssignBatch(List<double[]> batch, double[][] centroids) {
+        int k = centroids.length, d = centroids[0].length;
+        double[][] localSums = new double[k][d];
+        long[] localCounts = new long[k];
+
+        for (double[] point : batch) {
+            int c = closestCentroid(point, centroids);
+            localCounts[c]++;
+            addPoint(localSums[c], point);
+        }
+
+        return new PartialResult(localSums, localCounts);
+    }
+
+    private static KMeansResult evaluate(Path datasetPath, CsvDataset dataset, double[][] centroids, int iterations, ExecutorService executor) throws IOException, InterruptedException, ExecutionException {
+        int k = centroids.length;
+        List<Callable<EvaluatePartial>> tasks = new ArrayList<>();
+        List<double[]> batch = new ArrayList<>(BATCH_SIZE);
+
+        dataset.forEachPoint(datasetPath, (point, rowNumber) -> {
+            batch.add(point);
+            if (batch.size() == BATCH_SIZE) {
+                List<double[]> currentBatch = List.copyOf(batch);
+                tasks.add(() -> processEvaluateBatch(currentBatch, centroids));
+                batch.clear();
+            }
+        });
+
+        if (!batch.isEmpty()) {
+            List<double[]> lastBatch = List.copyOf(batch);
+            tasks.add(() -> processEvaluateBatch(lastBatch, centroids));
+        }
+
+        List<Future<EvaluatePartial>> futures = executor.invokeAll(tasks);
+
+        long[] clusterSizes = new long[k];
+        double sumSquaredError = 0.0;
+
+        for (Future<EvaluatePartial> f : futures) {
+            EvaluatePartial ep = f.get();
+            for (int c = 0; c < k; c++)
+                clusterSizes[c] += ep.clusterSizes()[c];
+            sumSquaredError += ep.sumSquaredError();
+        }
+
+        return new KMeansResult(copy(centroids), dataset.featureNames(), clusterSizes, iterations, sumSquaredError);
+    }
+
+    private static EvaluatePartial processEvaluateBatch(List<double[]> batch, double[][] centroids) {
+        int k = centroids.length;
+        long[] clusterSizes = new long[k];
+        double sumSquaredError = 0.0;
+
+        for (double[] point : batch) {
+            int c = closestCentroid(point, centroids);
+            clusterSizes[c]++;
+            sumSquaredError += squaredDistance(point, centroids[c]);
+        }
+
+        return new EvaluatePartial(clusterSizes, sumSquaredError);
     }
 
     private static double[][] recomputeCentroids(double[][] currentCentroids, double[][] sums, long[] counts) {
@@ -142,8 +233,7 @@ public final class KMeans {
         for (int i = 0; i < centroids.length; i++) {
             copy[i] = centroids[i].clone();
         }
-        
+
         return copy;
     }
-
 }
