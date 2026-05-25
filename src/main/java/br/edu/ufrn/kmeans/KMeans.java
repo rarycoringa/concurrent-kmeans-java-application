@@ -4,7 +4,6 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -23,12 +22,8 @@ public final class KMeans {
         List<double[]> seeds = dataset.readInitialCentroids(datasetPath, k);
         logger.info("Initialized " + k + " centroids from the first rows of the dataset.");
 
-
         double[][] centroids = new double[k][];
-        
-        for (int i = 0; i < k; i++) {
-            centroids[i] = seeds.get(i).clone();
-        }
+        for (int i = 0; i < k; i++) centroids[i] = seeds.get(i).clone();
 
         int n = Runtime.getRuntime().availableProcessors();
         ExecutorService executor = Executors.newFixedThreadPool(n, Thread.ofPlatform().factory());
@@ -40,7 +35,21 @@ public final class KMeans {
                 logger.info("Starting iteration " + currentIteration + " of " + maxIterations + ".");
 
                 double[][] snapshot = copy(centroids);
-                List<Future<PartialResult>> futures = executor.invokeAll(buildAssignTasks(datasetPath, dataset, snapshot));
+                List<Future<PartialResult>> futures = new ArrayList<>();
+                List<double[]> batch = new ArrayList<>(BATCH_SIZE);
+
+                dataset.forEachPoint(datasetPath, (point, rowNumber) -> {
+                    batch.add(point);
+                    if (batch.size() == BATCH_SIZE) {
+                        List<double[]> current = List.copyOf(batch);
+                        futures.add(executor.submit(() -> processAssignBatch(current, snapshot)));
+                        batch.clear();
+                    }
+                });
+                if (!batch.isEmpty()) {
+                    List<double[]> last = List.copyOf(batch);
+                    futures.add(executor.submit(() -> processAssignBatch(last, snapshot)));
+                }
 
                 double[][] sums = new double[k][dataset.featureCount()];
                 long[] counts = new long[k];
@@ -82,27 +91,6 @@ public final class KMeans {
         }
     }
 
-    private static List<Callable<PartialResult>> buildAssignTasks(Path datasetPath, CsvDataset dataset, double[][] snapshot) throws IOException {
-        List<Callable<PartialResult>> tasks = new ArrayList<>();
-        List<double[]> batch = new ArrayList<>(BATCH_SIZE);
-
-        dataset.forEachPoint(datasetPath, (point, rowNumber) -> {
-            batch.add(point);
-            if (batch.size() == BATCH_SIZE) {
-                List<double[]> currentBatch = List.copyOf(batch);
-                tasks.add(() -> processAssignBatch(currentBatch, snapshot));
-                batch.clear();
-            }
-        });
-
-        if (!batch.isEmpty()) {
-            List<double[]> lastBatch = List.copyOf(batch);
-            tasks.add(() -> processAssignBatch(lastBatch, snapshot));
-        }
-
-        return tasks;
-    }
-
     private static PartialResult processAssignBatch(List<double[]> batch, double[][] centroids) {
         int k = centroids.length, d = centroids[0].length;
         double[][] localSums = new double[k][d];
@@ -119,28 +107,24 @@ public final class KMeans {
 
     private static KMeansResult evaluate(Path datasetPath, CsvDataset dataset, double[][] centroids, int iterations, ExecutorService executor) throws IOException, InterruptedException, ExecutionException {
         int k = centroids.length;
-        List<Callable<EvaluatePartial>> tasks = new ArrayList<>();
+        List<Future<EvaluatePartial>> futures = new ArrayList<>();
         List<double[]> batch = new ArrayList<>(BATCH_SIZE);
 
         dataset.forEachPoint(datasetPath, (point, rowNumber) -> {
             batch.add(point);
             if (batch.size() == BATCH_SIZE) {
-                List<double[]> currentBatch = List.copyOf(batch);
-                tasks.add(() -> processEvaluateBatch(currentBatch, centroids));
+                List<double[]> current = List.copyOf(batch);
+                futures.add(executor.submit(() -> processEvaluateBatch(current, centroids)));
                 batch.clear();
             }
         });
-
         if (!batch.isEmpty()) {
-            List<double[]> lastBatch = List.copyOf(batch);
-            tasks.add(() -> processEvaluateBatch(lastBatch, centroids));
+            List<double[]> last = List.copyOf(batch);
+            futures.add(executor.submit(() -> processEvaluateBatch(last, centroids)));
         }
-
-        List<Future<EvaluatePartial>> futures = executor.invokeAll(tasks);
 
         long[] clusterSizes = new long[k];
         double sumSquaredError = 0.0;
-
         for (Future<EvaluatePartial> f : futures) {
             EvaluatePartial ep = f.get();
             for (int c = 0; c < k; c++)
@@ -175,10 +159,8 @@ public final class KMeans {
             }
 
             updated[cluster] = new double[currentCentroids[cluster].length];
-
-            for (int dimension = 0; dimension < currentCentroids[cluster].length; dimension++) {
+            for (int dimension = 0; dimension < currentCentroids[cluster].length; dimension++)
                 updated[cluster][dimension] = sums[cluster][dimension] / counts[cluster];
-            }
         }
 
         return updated;
@@ -190,7 +172,6 @@ public final class KMeans {
 
         for (int i = 1; i < centroids.length; i++) {
             double distance = squaredDistance(point, centroids[i]);
-
             if (distance < bestDistance) {
                 bestDistance = distance;
                 bestIndex = i;
@@ -202,38 +183,29 @@ public final class KMeans {
 
     static double squaredDistance(double[] left, double[] right) {
         double total = 0.0d;
-
         for (int i = 0; i < left.length; i++) {
             double delta = left[i] - right[i];
             total += delta * delta;
         }
-
         return total;
     }
 
     private static void addPoint(double[] accumulator, double[] point) {
-        for (int i = 0; i < accumulator.length; i++) {
+        for (int i = 0; i < accumulator.length; i++)
             accumulator[i] += point[i];
-        }
     }
 
     private static double maxShift(double[][] current, double[][] updated) {
         double maxShift = 0.0d;
-
-        for (int i = 0; i < current.length; i++) {
+        for (int i = 0; i < current.length; i++)
             maxShift = Math.max(maxShift, squaredDistance(current[i], updated[i]));
-        }
-
         return maxShift;
     }
 
     private static double[][] copy(double[][] centroids) {
         double[][] copy = new double[centroids.length][];
-
-        for (int i = 0; i < centroids.length; i++) {
+        for (int i = 0; i < centroids.length; i++)
             copy[i] = centroids[i].clone();
-        }
-
         return copy;
     }
 }
