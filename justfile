@@ -36,14 +36,14 @@ profile dataset_path:
     mkdir -p results/profile
     mvn --quiet exec:exec \
         -Dexec.executable=java \
-        -Dexec.args="-XX:StartFlightRecording=name=serial,settings=profile,dumponexit=true,filename=results/profile/serial.jfr -cp %classpath br.edu.ufrn.kmeans.Main {{dataset_path}}"
+        -Dexec.args="-XX:StartFlightRecording=name=concurrent,settings=profile,dumponexit=true,filename=results/profile/concurrent.jfr -cp %classpath br.edu.ufrn.kmeans.Main {{dataset_path}}"
 
 profile-report:
     jfr print --events jdk.ExecutionSample \
-        results/profile/serial.jfr > results/profile/hot-methods.txt
+        results/profile/concurrent.jfr > results/profile/hot-methods.txt
     jfr print --events jdk.GarbageCollection,jdk.GCHeapSummary \
-        results/profile/serial.jfr > results/profile/gc.txt
+        results/profile/concurrent.jfr > results/profile/gc.txt
     jfr print --events jdk.JavaThreadStatistics,jdk.ThreadCPULoad \
-        results/profile/serial.jfr > results/profile/threads.txt
+        results/profile/concurrent.jfr > results/profile/threads.txt
     jfr print --events jdk.FileRead \
-        results/profile/serial.jfr > results/profile/io.txt
+        results/profile/concurrent.jfr > results/profile/io.txt
