@@ -26,81 +26,69 @@ public final class KMeans {
         for (int i = 0; i < k; i++) centroids[i] = seeds.get(i).clone();
 
         int n = Runtime.getRuntime().availableProcessors();
-        // Platform threads: CPU-bound compute workers (closestCentroid / squaredDistance)
-        ExecutorService computePool = Executors.newFixedThreadPool(n, Thread.ofPlatform().factory());
-        // Virtual thread: I/O-bound coordinator (readLine + Future.get() both unmount)
-        ExecutorService coordinator = Executors.newFixedThreadPool(n, Thread.ofVirtual().factory());
+        ExecutorService executor = Executors.newFixedThreadPool(n, Thread.ofVirtual().factory());
+        int completedIterations = 0;
 
         try {
-            return coordinator.submit(
-                () -> runClustering(datasetPath, dataset, k, maxIterations, tolerance, centroids, computePool)
-            ).get();
+            for (int iteration = 1; iteration <= maxIterations; iteration++) {
+                int currentIteration = iteration;
+                logger.info("Starting iteration " + currentIteration + " of " + maxIterations + ".");
+
+                double[][] snapshot = copy(centroids);
+                List<Future<PartialResult>> futures = new ArrayList<>();
+                List<double[]> batch = new ArrayList<>(BATCH_SIZE);
+
+                dataset.forEachPoint(datasetPath, (point, rowNumber) -> {
+                    batch.add(point);
+                    if (batch.size() == BATCH_SIZE) {
+                        List<double[]> current = List.copyOf(batch);
+                        futures.add(executor.submit(() -> processAssignBatch(current, snapshot)));
+                        batch.clear();
+                    }
+                });
+                if (!batch.isEmpty()) {
+                    List<double[]> last = List.copyOf(batch);
+                    futures.add(executor.submit(() -> processAssignBatch(last, snapshot)));
+                }
+
+                double[][] sums = new double[k][dataset.featureCount()];
+                long[] counts = new long[k];
+                for (Future<PartialResult> f : futures) {
+                    PartialResult pr = f.get();
+                    for (int c = 0; c < k; c++) {
+                        counts[c] += pr.counts()[c];
+                        for (int d = 0; d < sums[c].length; d++)
+                            sums[c][d] += pr.sums()[c][d];
+                    }
+                }
+
+                double[][] updatedCentroids = recomputeCentroids(centroids, sums, counts);
+                completedIterations = iteration;
+
+                double shift = maxShift(centroids, updatedCentroids);
+                logger.info("Finished iteration " + currentIteration + " with max centroid shift " + shift + ".");
+
+                centroids = updatedCentroids;
+
+                if (shift <= tolerance) {
+                    logger.info("Converged at iteration " + currentIteration + ".");
+                    break;
+                }
+            }
+
+            logger.info("Evaluating final clusters.");
+            return evaluate(datasetPath, dataset, centroids, completedIterations, executor);
+
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("Clustering interrupted", e);
         } catch (ExecutionException e) {
             Throwable cause = e.getCause();
             if (cause instanceof IOException ioe) throw ioe;
-            throw new IOException("Clustering failed", cause);
+            throw new IOException("Batch processing failed", cause);
         } finally {
-            coordinator.shutdown();
-            computePool.shutdown();
+            executor.shutdown();
         }
-    }
-
-    private static KMeansResult runClustering(Path datasetPath, CsvDataset dataset, int k, int maxIterations, double tolerance, double[][] centroids, ExecutorService computePool) throws IOException, InterruptedException, ExecutionException {
-        int completedIterations = 0;
-
-        for (int iteration = 1; iteration <= maxIterations; iteration++) {
-            int currentIteration = iteration;
-            logger.info("Starting iteration " + currentIteration + " of " + maxIterations + ".");
-
-            double[][] snapshot = copy(centroids);
-            List<Future<PartialResult>> futures = new ArrayList<>();
-            List<double[]> batch = new ArrayList<>(BATCH_SIZE);
-
-            // readLine() inside forEachPoint blocks on disk I/O — virtual thread unmounts here
-            dataset.forEachPoint(datasetPath, (point, rowNumber) -> {
-                batch.add(point);
-                if (batch.size() == BATCH_SIZE) {
-                    List<double[]> current = List.copyOf(batch);
-                    futures.add(computePool.submit(() -> processAssignBatch(current, snapshot)));
-                    batch.clear();
-                }
-            });
-            if (!batch.isEmpty()) {
-                List<double[]> last = List.copyOf(batch);
-                futures.add(computePool.submit(() -> processAssignBatch(last, snapshot)));
-            }
-
-            double[][] sums = new double[k][dataset.featureCount()];
-            long[] counts = new long[k];
-            for (Future<PartialResult> f : futures) {
-                // Future.get() parks via LockSupport — virtual thread unmounts here
-                PartialResult pr = f.get();
-                for (int c = 0; c < k; c++) {
-                    counts[c] += pr.counts()[c];
-                    for (int d = 0; d < sums[c].length; d++)
-                        sums[c][d] += pr.sums()[c][d];
-                }
-            }
-
-            double[][] updatedCentroids = recomputeCentroids(centroids, sums, counts);
-            completedIterations = iteration;
-
-            double shift = maxShift(centroids, updatedCentroids);
-            logger.info("Finished iteration " + currentIteration + " with max centroid shift " + shift + ".");
-
-            centroids = updatedCentroids;
-
-            if (shift <= tolerance) {
-                logger.info("Converged at iteration " + currentIteration + ".");
-                break;
-            }
-        }
-
-        logger.info("Evaluating final clusters.");
-        return evaluate(datasetPath, dataset, centroids, completedIterations, computePool);
     }
 
     private static PartialResult processAssignBatch(List<double[]> batch, double[][] centroids) {

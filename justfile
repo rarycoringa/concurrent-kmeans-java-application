@@ -11,42 +11,43 @@ run dataset_path:
 bench-micro-build:
     mvn --quiet package -DskipTests
 
-bench-micro dataset_path filter="KMeansBenchmark":
-    mkdir -p results
+bench-micro dataset_path version="v2" filter="KMeansBenchmark":
+    mkdir -p results/micro
     java -jar target/kmeans-1.0-SNAPSHOT-benchmarks.jar \
         -p datasetPath={{dataset_path}} \
         -rf json \
-        -rff results/jmh-results.json \
+        -rff results/micro/{{version}}.json \
         {{filter}}
 
 bench-macro-deploy:
     mvn --quiet package -DskipTests
     cp target/kmeans-1.0-SNAPSHOT.jar /home/rarycoringa/university/concurrent/jmeter/lib/ext/
 
-bench-macro-g1:
-    GC_ALGO="-XX:+UseG1GC" /home/rarycoringa/university/concurrent/jmeter/bin/jmeter
+bench-macro-run version="v2-virtual":
+    mkdir -p results/macro/{{version}}
+    for jmx in jmeter/ParallelGC-threads-*.jmx; do \
+        name=$$(basename $$jmx .jmx); \
+        echo "=== $$name ==="; \
+        GC_ALGO="-XX:+UseParallelGC" /home/rarycoringa/university/concurrent/jmeter/bin/jmeter \
+            -n -t "$$jmx" -l /dev/null; \
+        echo "done"; \
+    done
 
-bench-macro-zgc:
-    GC_ALGO="-XX:+UseZGC" /home/rarycoringa/university/concurrent/jmeter/bin/jmeter
-
-bench-macro-parallel:
-    GC_ALGO="-XX:+UseParallelGC" /home/rarycoringa/university/concurrent/jmeter/bin/jmeter
-
-profile dataset_path:
-    mkdir -p results/profile
+profile dataset_path version="v2":
+    mkdir -p results/profile/{{version}}
     mvn --quiet exec:exec \
         -Dexec.executable=java \
-        -Dexec.args="-XX:StartFlightRecording=name=concurrent,settings=profile,dumponexit=true,filename=results/profile/concurrent.jfr -cp %classpath br.edu.ufrn.kmeans.Main {{dataset_path}}"
+        -Dexec.args="-XX:StartFlightRecording=name=concurrent,settings=profile,dumponexit=true,filename=results/profile/{{version}}/concurrent.jfr -cp %classpath br.edu.ufrn.kmeans.Main {{dataset_path}}"
 
-profile-report:
+profile-report version="v2":
     jfr print --events jdk.ExecutionSample \
-        results/profile/concurrent.jfr > results/profile/hot-methods.txt
+        results/profile/{{version}}/concurrent.jfr > results/profile/{{version}}/hot-methods.txt
     jfr print --events jdk.GarbageCollection,jdk.GCHeapSummary \
-        results/profile/concurrent.jfr > results/profile/gc.txt
+        results/profile/{{version}}/concurrent.jfr > results/profile/{{version}}/gc.txt
     jfr print --events jdk.JavaThreadStatistics,jdk.ThreadCPULoad \
-        results/profile/concurrent.jfr > results/profile/threads.txt
+        results/profile/{{version}}/concurrent.jfr > results/profile/{{version}}/threads.txt
     jfr print --events jdk.FileRead \
-        results/profile/concurrent.jfr > results/profile/io.txt
+        results/profile/{{version}}/concurrent.jfr > results/profile/{{version}}/io.txt
 
 bench-stress-build:
     mvn --quiet package -DskipTests

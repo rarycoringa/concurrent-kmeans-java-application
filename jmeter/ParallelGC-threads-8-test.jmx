@@ -100,7 +100,7 @@
               <idleTime>true</idleTime>
             </value>
           </objProp>
-          <stringProp name="filename">/home/rarycoringa/university/concurrent/kmeans-java/results/macro/ParallelGC-threads-8-results.jtl</stringProp>
+          <stringProp name="filename">/home/rarycoringa/university/concurrent/kmeans-java/results/macro/v2-hybrid/ParallelGC-threads-8-results.jtl</stringProp>
         </ResultCollector>
         <hashTree/>
       </hashTree>
