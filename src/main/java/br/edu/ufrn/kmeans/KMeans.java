@@ -26,7 +26,7 @@ public final class KMeans {
         for (int i = 0; i < k; i++) centroids[i] = seeds.get(i).clone();
 
         int n = Runtime.getRuntime().availableProcessors();
-        ExecutorService executor = Executors.newFixedThreadPool(n, Thread.ofPlatform().factory());
+        ExecutorService executor = Executors.newFixedThreadPool(n, Thread.ofVirtual().factory());
         int completedIterations = 0;
 
         try {
