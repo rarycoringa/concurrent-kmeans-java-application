@@ -93,6 +93,12 @@ public final class CsvDataset {
         return centroids;
     }
 
+    public double[][] loadAllPoints(Path path) throws IOException {
+        List<double[]> points = new ArrayList<>();
+        forEachPoint(path, (point, row) -> points.add(point));
+        return points.toArray(new double[0][]);
+    }
+
     public void forEachPoint(Path path, PointConsumer consumer) throws IOException {
         try (BufferedReader reader = Files.newBufferedReader(path)) {
             reader.readLine();

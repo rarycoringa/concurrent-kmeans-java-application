@@ -13,7 +13,7 @@ bench-micro-build:
 
 bench-micro dataset_path version="v2" filter="KMeansBenchmark":
     mkdir -p results/micro
-    java -jar target/kmeans-1.0-SNAPSHOT-benchmarks.jar \
+    java -Xmx4g -jar target/kmeans-1.0-SNAPSHOT-benchmarks.jar \
         -p datasetPath={{dataset_path}} \
         -rf json \
         -rff results/micro/{{version}}.json \
@@ -23,12 +23,12 @@ bench-macro-deploy:
     mvn --quiet package -DskipTests
     cp target/kmeans-1.0-SNAPSHOT.jar /home/rarycoringa/university/concurrent/jmeter/lib/ext/
 
-bench-macro-run version="v2-virtual":
+bench-macro-run version="v3":
     mkdir -p results/macro/{{version}}
     for jmx in jmeter/ParallelGC-threads-*.jmx; do \
         name=$$(basename $$jmx .jmx); \
         echo "=== $$name ==="; \
-        GC_ALGO="-XX:+UseParallelGC" /home/rarycoringa/university/concurrent/jmeter/bin/jmeter \
+        GC_ALGO="-XX:+UseParallelGC" JVM_ARGS="-Xmx4g" /home/rarycoringa/university/concurrent/jmeter/bin/jmeter \
             -n -t "$$jmx" -l /dev/null; \
         echo "done"; \
     done
@@ -37,7 +37,7 @@ profile dataset_path version="v2":
     mkdir -p results/profile/{{version}}
     mvn --quiet exec:exec \
         -Dexec.executable=java \
-        -Dexec.args="-XX:StartFlightRecording=name=concurrent,settings=profile,dumponexit=true,filename=results/profile/{{version}}/concurrent.jfr -cp %classpath br.edu.ufrn.kmeans.Main {{dataset_path}}"
+        -Dexec.args="-Xmx4g -XX:StartFlightRecording=name=concurrent,settings=profile,dumponexit=true,filename=results/profile/{{version}}/concurrent.jfr -cp %classpath br.edu.ufrn.kmeans.Main {{dataset_path}}"
 
 profile-report version="v2":
     jfr print --events jdk.ExecutionSample \

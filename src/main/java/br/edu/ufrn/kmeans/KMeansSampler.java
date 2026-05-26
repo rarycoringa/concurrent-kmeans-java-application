@@ -5,12 +5,17 @@ import org.apache.jmeter.protocol.java.sampler.AbstractJavaSamplerClient;
 import org.apache.jmeter.protocol.java.sampler.JavaSamplerContext;
 import org.apache.jmeter.samplers.SampleResult;
 
+import java.io.IOException;
 import java.io.Serializable;
 import java.nio.file.Path;
 
 public class KMeansSampler extends AbstractJavaSamplerClient implements Serializable {
 
     private static final long serialVersionUID = 1L;
+
+    private static volatile double[][] sharedPoints;
+    private static volatile CsvDataset sharedDataset;
+    private static final Object LOCK = new Object();
 
     @Override
     public Arguments getDefaultParameters() {
@@ -20,6 +25,20 @@ public class KMeansSampler extends AbstractJavaSamplerClient implements Serializ
         args.addArgument("maxIter", "3");
         args.addArgument("tol", "0.0");
         return args;
+    }
+
+    private static void ensureLoaded(String datasetPath) throws IOException {
+        if (sharedPoints == null) {
+            synchronized (LOCK) {
+                if (sharedPoints == null) {
+                    Path path = Path.of(datasetPath);
+                    CsvDataset csv = CsvDataset.load(path);
+                    double[][] pts = csv.loadAllPoints(path);
+                    sharedDataset = csv;
+                    sharedPoints = pts;
+                }
+            }
+        }
     }
 
     @Override
@@ -34,9 +53,8 @@ public class KMeansSampler extends AbstractJavaSamplerClient implements Serializ
         result.sampleStart();
 
         try {
-            Path path = Path.of(datasetPath);
-            CsvDataset csv = CsvDataset.load(path);
-            KMeansResult kmResult = KMeans.cluster(path, csv, k, maxIter, tol);
+            ensureLoaded(datasetPath);
+            KMeansResult kmResult = KMeans.cluster(sharedPoints, sharedDataset, k, maxIter, tol);
 
             result.sampleEnd();
             result.setResponseCode("200");

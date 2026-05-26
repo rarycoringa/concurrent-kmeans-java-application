@@ -22,11 +22,13 @@ public class KMeansBenchmark {
 
         public Path path;
         public CsvDataset dataset;
+        public double[][] points;
 
         @Setup(Level.Trial)
         public void setup() throws IOException {
             path = Path.of(datasetPath);
             dataset = CsvDataset.load(path);
+            points = dataset.loadAllPoints(path);
         }
     }
 
@@ -65,13 +67,13 @@ public class KMeansBenchmark {
     // B1: primary report number — full end-to-end cluster run
     @Benchmark
     public KMeansResult b1_fullRun(DatasetState s) throws IOException {
-        return KMeans.cluster(s.path, s.dataset, 10, 20, 1e-6);
+        return KMeans.cluster(s.points, s.dataset, 10, 20, 1e-6);
     }
 
     // B2: isolate per-iteration cost with a short fixed run
     @Benchmark
     public KMeansResult b2_perIterationCost(DatasetState s) throws IOException {
-        return KMeans.cluster(s.path, s.dataset, 10, 5, 0);
+        return KMeans.cluster(s.points, s.dataset, 10, 5, 0);
     }
 
     // B3: inner-loop hotspot — point-to-centroid distance scan
