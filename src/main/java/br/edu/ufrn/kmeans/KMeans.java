@@ -4,15 +4,13 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.DoubleAdder;
+import java.util.concurrent.StructuredTaskScope;
 import java.util.logging.Logger;
 
 public final class KMeans {
 
     private static final Logger logger = Logger.getLogger(KMeans.class.getName());
+    private static final ScopedValue<double[][]> CENTROIDS = ScopedValue.newInstance();
 
     // Path-based entry point: loads points from disk, then delegates
     public static KMeansResult cluster(Path datasetPath, CsvDataset dataset, int k, int maxIterations, double tolerance) throws IOException {
@@ -36,7 +34,6 @@ public final class KMeans {
         for (int i = 0; i < k; i++) centroids[i] = seeds.get(i).clone();
 
         int n = Runtime.getRuntime().availableProcessors();
-        ExecutorService executor = Executors.newFixedThreadPool(n, Thread.ofVirtual().factory());
         int completedIterations = 0;
 
         try {
@@ -47,21 +44,18 @@ public final class KMeans {
                 logger.info("Starting iteration " + currentIteration + " of " + maxIterations + ".");
 
                 double[][] snapshot = copy(centroids);
-                @SuppressWarnings("unchecked")
-                PartialResult[] results = new PartialResult[n];
-                CountDownLatch latch = new CountDownLatch(n);
-
-                for (int t = 0; t < n; t++) {
-                    final int from = boundaries[t];
-                    final int to   = boundaries[t + 1];
-                    final int tid  = t;
-                    executor.submit(() -> {
-                        results[tid] = processChunk(points, from, to, snapshot);
-                        latch.countDown();
-                    });
-                }
-
-                latch.await();
+                List<PartialResult> results = ScopedValue.where(CENTROIDS, snapshot).call(() -> {
+                    try (var scope = StructuredTaskScope.open()) {
+                        List<StructuredTaskScope.Subtask<PartialResult>> subtasks = new ArrayList<>(n);
+                        for (int t = 0; t < n; t++) {
+                            final int from = boundaries[t];
+                            final int to   = boundaries[t + 1];
+                            subtasks.add(scope.fork(() -> processChunk(points, from, to)));
+                        }
+                        scope.join();
+                        return subtasks.stream().map(StructuredTaskScope.Subtask::get).toList();
+                    }
+                });
 
                 double[][] sums = new double[k][dataset.featureCount()];
                 long[] counts = new long[k];
@@ -88,17 +82,15 @@ public final class KMeans {
             }
 
             logger.info("Evaluating final clusters.");
-            return evaluate(points, dataset, centroids, completedIterations, n, executor);
+            return evaluate(points, dataset, centroids, completedIterations, n);
 
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Clustering interrupted", e);
-        } finally {
-            executor.shutdown();
+        } catch (Exception e) {
+            throw new IOException("Clustering failed", e);
         }
     }
 
-    private static PartialResult processChunk(double[][] points, int from, int to, double[][] centroids) {
+    private static PartialResult processChunk(double[][] points, int from, int to) {
+        double[][] centroids = CENTROIDS.get();
         int k = centroids.length, d = centroids[0].length;
         double[][] localSums = new double[k][d];
         long[] localCounts = new long[k];
@@ -112,37 +104,50 @@ public final class KMeans {
         return new PartialResult(localSums, localCounts);
     }
 
-    private static KMeansResult evaluate(double[][] points, CsvDataset dataset, double[][] centroids, int iterations, int n, ExecutorService executor) throws InterruptedException {
+    private static KMeansResult evaluate(double[][] points, CsvDataset dataset, double[][] centroids, int iterations, int n) throws InterruptedException {
         int k = centroids.length;
         int[] boundaries = chunkBoundaries(points.length, n);
 
         long[] clusterSizes = new long[k];
-        DoubleAdder sse = new DoubleAdder();
-        long[][] partialSizes = new long[n][k];
-        CountDownLatch latch = new CountDownLatch(n);
+        double sse = 0.0;
 
-        for (int t = 0; t < n; t++) {
-            final int from = boundaries[t];
-            final int to   = boundaries[t + 1];
-            final int tid  = t;
-            executor.submit(() -> {
-                for (int i = from; i < to; i++) {
-                    int c = closestCentroid(points[i], centroids);
-                    partialSizes[tid][c]++;
-                    sse.add(squaredDistance(points[i], centroids[c]));
+        List<EvalResult> results = ScopedValue.where(CENTROIDS, centroids).call(() -> {
+            try (var scope = StructuredTaskScope.open()) {
+                List<StructuredTaskScope.Subtask<EvalResult>> subtasks = new ArrayList<>(n);
+                for (int t = 0; t < n; t++) {
+                    final int from = boundaries[t];
+                    final int to   = boundaries[t + 1];
+                    subtasks.add(scope.fork(() -> evaluateChunk(points, from, to, k)));
                 }
-                latch.countDown();
-            });
+                scope.join();
+                return subtasks.stream().map(StructuredTaskScope.Subtask::get).toList();
+            }
+        });
+
+        for (EvalResult result : results) {
+            sse += result.sse();
+            for (int c = 0; c < k; c++)
+                clusterSizes[c] += result.sizes()[c];
         }
 
-        latch.await();
-
-        for (int t = 0; t < n; t++)
-            for (int c = 0; c < k; c++)
-                clusterSizes[c] += partialSizes[t][c];
-
-        return new KMeansResult(copy(centroids), dataset.featureNames(), clusterSizes, iterations, sse.sum());
+        return new KMeansResult(copy(centroids), dataset.featureNames(), clusterSizes, iterations, sse);
     }
+
+    private static EvalResult evaluateChunk(double[][] points, int from, int to, int k) {
+        double[][] centroids = CENTROIDS.get();
+        long[] sizes = new long[k];
+        double sse = 0.0;
+
+        for (int i = from; i < to; i++) {
+            int c = closestCentroid(points[i], centroids);
+            sizes[c]++;
+            sse += squaredDistance(points[i], centroids[c]);
+        }
+
+        return new EvalResult(sizes, sse);
+    }
+
+    private record EvalResult(long[] sizes, double sse) {}
 
     private static int[] chunkBoundaries(int total, int n) {
         int[] b = new int[n + 1];
