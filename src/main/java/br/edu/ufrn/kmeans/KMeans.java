@@ -30,10 +30,7 @@ public final class KMeans {
         // Load CSV, drop non-feature columns, and cache — the DataFrame stays in
         // memory for the lifetime of all iterations, same as the double[][] in v1-v5
         Dataset<Row> df = spark.read()
-                .format("csv")
-                .option("header", "true")
-                .option("inferSchema", "true")
-                .load(datasetPath)
+                .parquet(datasetPath)
                 .drop(NON_FEATURE_COLUMNS)
                 .cache();
 
