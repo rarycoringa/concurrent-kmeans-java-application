@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="OFF">
+    <Appenders>
+        <Console name="STDOUT" target="SYSTEM_OUT">
+            <PatternLayout pattern="%d{HH:mm:ss} %-5level %logger{1} - %msg%n"/>
+        </Console>
+    </Appenders>
+    <Loggers>
+        <!-- our application: keep INFO visible -->
+        <Logger name="br.edu.ufrn.kmeans" level="INFO" additivity="false">
+            <AppenderRef ref="STDOUT"/>
+        </Logger>
+        <!-- suppress Spark/Hadoop/Netty verbose INFO output -->
+        <Root level="WARN">
+            <AppenderRef ref="STDOUT"/>
+        </Root>
+    </Loggers>
+</Configuration>

@@ -1,6 +1,5 @@
 package br.edu.ufrn.kmeans;
 
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Locale;
@@ -13,9 +12,9 @@ public final class Main {
     private static final double TOLERANCE = 1.0e-6;
     private static final Logger logger = Logger.getLogger(Main.class.getName());
 
-    public static void main(String[] args) throws IOException {
+    public static void main(String[] args) {
         if (args.length != 1) {
-            logger.severe("Usage: mvn exec:java -Dexec.args=\"<dataset-path>\"");
+            logger.severe("Usage: mvn exec:exec -DdatasetPath=\"<dataset-path>\"");
             System.exit(1);
         }
 
@@ -25,21 +24,19 @@ public final class Main {
             throw new IllegalArgumentException("Dataset file does not exist: " + datasetPath);
         }
 
-        logger.info("Starting K-Means baseline with dataset: " + datasetPath);
+        logger.info("Starting K-Means v6 (Spark) with dataset: " + datasetPath);
 
-        CsvDataset dataset = CsvDataset.load(datasetPath);
+        long startNs = System.nanoTime();
+        KMeansResult result = KMeans.cluster(datasetPath.toString(), K, MAX_ITERATIONS, TOLERANCE);
+        long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
 
-        logger.info("Loaded dataset header with " + dataset.featureCount() + " feature columns.");
-
-        KMeansResult result = KMeans.cluster(datasetPath, dataset, K, MAX_ITERATIONS, TOLERANCE);
-        
-        logger.info("K-Means finished after " + result.iterations() + " iterations.");
+        logger.info("K-Means finished after " + result.iterations() + " iterations in " + elapsedMs + " ms.");
 
         logSummary(datasetPath, result);
     }
 
     private static void logSummary(Path datasetPath, KMeansResult result) {
-        logger.info("K-Means baseline");
+        logger.info("K-Means v6 (Spark)");
         logger.info("dataset=" + datasetPath);
         logger.info("k=" + result.centroids().length);
         logger.info("features=" + String.join(", ", result.featureNames()));

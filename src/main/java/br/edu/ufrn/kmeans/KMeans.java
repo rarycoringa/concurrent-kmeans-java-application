@@ -1,247 +1,167 @@
 package br.edu.ufrn.kmeans;
 
-import java.io.IOException;
-import java.nio.file.Path;
-import java.util.ArrayList;
+import org.apache.spark.api.java.JavaRDD;
+import org.apache.spark.api.java.JavaSparkContext;
+import org.apache.spark.broadcast.Broadcast;
+import org.apache.spark.sql.Dataset;
+import org.apache.spark.sql.Row;
+import org.apache.spark.sql.SparkSession;
+import scala.Tuple2;
+
+import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.RecursiveTask;
+import java.util.Map;
 import java.util.logging.Logger;
 
 public final class KMeans {
 
     private static final Logger logger = Logger.getLogger(KMeans.class.getName());
 
-    // Path-based entry point: loads points from disk, then delegates
-    public static KMeansResult cluster(Path datasetPath, CsvDataset dataset, int k, int maxIterations, double tolerance) throws IOException {
-        logger.info("Loading dataset into memory.");
-        double[][] points = dataset.loadAllPoints(datasetPath);
-        List<double[]> seeds = dataset.readInitialCentroids(datasetPath, k);
-        return cluster(points, seeds, dataset, k, maxIterations, tolerance);
-    }
+    private static final String[] NON_FEATURE_COLUMNS = {"order_id", "customer_id", "seller_id", "city"};
 
-    // Points-based entry point: used by benchmarks (points already in memory)
-    public static KMeansResult cluster(double[][] points, CsvDataset dataset, int k, int maxIterations, double tolerance) throws IOException {
-        List<double[]> seeds = new ArrayList<>(k);
-        for (int i = 0; i < k; i++) seeds.add(points[i].clone());
-        return cluster(points, seeds, dataset, k, maxIterations, tolerance);
-    }
+    public static KMeansResult cluster(String datasetPath, int k, int maxIterations, double tolerance) {
+        SparkSession spark = SparkSession.builder()
+                .appName("KMeans v6")
+                .master("local[*]")
+                .config("spark.driver.memory", "4g")
+                .config("spark.sql.shuffle.partitions", "16")
+                .getOrCreate();
 
-    private static KMeansResult cluster(double[][] points, List<double[]> seeds, CsvDataset dataset, int k, int maxIterations, double tolerance) throws IOException {
-        logger.info("Initialized " + k + " centroids from the first rows of the dataset.");
+        // Load CSV, drop non-feature columns, and cache — the DataFrame stays in
+        // memory for the lifetime of all iterations, same as the double[][] in v1-v5
+        Dataset<Row> df = spark.read()
+                .format("csv")
+                .option("header", "true")
+                .option("inferSchema", "true")
+                .load(datasetPath)
+                .drop(NON_FEATURE_COLUMNS)
+                .cache();
 
+        String[] featureNames = df.columns();
+        int d = featureNames.length;
+
+        logger.info("Dataset loaded: " + df.count() + " points, " + d + " features.");
+
+        // Convert to JavaRDD<double[]> and cache — reused every iteration
+        JavaRDD<double[]> points = df.javaRDD()
+                .map(row -> toDoubleArray(row, d))
+                .cache();
+        points.count(); // materialise cache before timing starts
+
+        // Seed centroids from the first k points (same strategy as all prior versions)
+        List<double[]> seeds = points.take(k);
         double[][] centroids = new double[k][];
         for (int i = 0; i < k; i++) centroids[i] = seeds.get(i).clone();
 
-        int n = Runtime.getRuntime().availableProcessors();
-        int threshold = points.length / (n * 4);
+        JavaSparkContext sc = JavaSparkContext.fromSparkContext(spark.sparkContext());
         int completedIterations = 0;
 
-        try {
-            for (int iteration = 1; iteration <= maxIterations; iteration++) {
-                int currentIteration = iteration;
-                logger.info("Starting iteration " + currentIteration + " of " + maxIterations + ".");
+        for (int iter = 1; iter <= maxIterations; iter++) {
+            final double[][] snapshot = copy(centroids);
+            // Broadcast centroid snapshot to all partitions — same role as the
+            // defensive copy() in v3/v4/v5: prevents reading partially-updated state
+            Broadcast<double[][]> bcCentroids = sc.broadcast(snapshot);
+            final int dims = d;
 
-                double[][] snapshot = copy(centroids);
-                PartialResult result = ForkJoinPool.commonPool()
-                    .invoke(new KMeansTask(points, 0, points.length, snapshot, threshold));
+            // Each point becomes (cluster, [f0..fd-1, count=1.0]).
+            // reduceByKey sums partition-locally then merges across partitions —
+            // the same local-accumulation pattern as processChunk in v3/v4/v5
+            Map<Integer, double[]> clusterSums = points
+                    .mapToPair(point -> {
+                        int cluster = closestCentroid(point, bcCentroids.value());
+                        double[] acc = Arrays.copyOf(point, dims + 1);
+                        acc[dims] = 1.0; // count in last element
+                        return new Tuple2<>(cluster, acc);
+                    })
+                    .reduceByKey((a, b) -> {
+                        double[] merged = new double[dims + 1];
+                        for (int i = 0; i <= dims; i++) merged[i] = a[i] + b[i];
+                        return merged;
+                    })
+                    .collectAsMap();
 
-                double[][] updatedCentroids = recomputeCentroids(centroids, result.sums(), result.counts());
-                completedIterations = iteration;
+            bcCentroids.destroy();
 
-                double shift = maxShift(centroids, updatedCentroids);
-                logger.info("Finished iteration " + currentIteration + " with max centroid shift " + shift + ".");
-
-                centroids = updatedCentroids;
-
-                if (shift <= tolerance) {
-                    logger.info("Converged at iteration " + currentIteration + ".");
-                    break;
-                }
+            double[][] newCentroids = copy(centroids); // preserve empty clusters unchanged
+            for (Map.Entry<Integer, double[]> e : clusterSums.entrySet()) {
+                double[] sumCount = e.getValue();
+                double count = sumCount[dims];
+                double[] mean = new double[dims];
+                for (int j = 0; j < dims; j++) mean[j] = sumCount[j] / count;
+                newCentroids[e.getKey()] = mean;
             }
 
-            logger.info("Evaluating final clusters.");
-            return evaluate(points, dataset, centroids, completedIterations, threshold);
+            completedIterations = iter;
+            double shift = maxShift(centroids, newCentroids);
+            centroids = newCentroids;
+            logger.info("Iteration " + iter + ": shift=" + shift);
 
-        } catch (Exception e) {
-            throw new IOException("Clustering failed", e);
-        }
-    }
-
-    private static class KMeansTask extends RecursiveTask<PartialResult> {
-        private final double[][] points;
-        private final double[][] centroids;
-        private final int from, to, threshold;
-
-        KMeansTask(double[][] points, int from, int to, double[][] centroids, int threshold) {
-            this.points = points;
-            this.from = from;
-            this.to = to;
-            this.centroids = centroids;
-            this.threshold = threshold;
-        }
-
-        @Override
-        protected PartialResult compute() {
-            if (to - from <= threshold) {
-                return processChunk(points, from, to, centroids);
+            if (shift <= tolerance) {
+                logger.info("Converged at iteration " + iter + ".");
+                break;
             }
-            int mid = (from + to) / 2;
-            KMeansTask left  = new KMeansTask(points, from, mid, centroids, threshold);
-            KMeansTask right = new KMeansTask(points, mid,  to,  centroids, threshold);
-            left.fork();
-            PartialResult rightResult = right.compute();
-            PartialResult leftResult  = left.join();
-            return mergePartial(leftResult, rightResult);
-        }
-    }
-
-    private static PartialResult processChunk(double[][] points, int from, int to, double[][] centroids) {
-        int k = centroids.length, d = centroids[0].length;
-        double[][] localSums = new double[k][d];
-        long[] localCounts = new long[k];
-
-        for (int i = from; i < to; i++) {
-            int c = closestCentroid(points[i], centroids);
-            localCounts[c]++;
-            addPoint(localSums[c], points[i]);
         }
 
-        return new PartialResult(localSums, localCounts);
-    }
+        // Evaluation pass: compute cluster sizes and SSE in one final RDD scan
+        final double[][] finalCentroids = centroids;
+        Map<Integer, double[]> evalMap = points
+                .mapToPair(point -> {
+                    int cluster = closestCentroid(point, finalCentroids);
+                    double dist = squaredDistance(point, finalCentroids[cluster]);
+                    return new Tuple2<>(cluster, new double[]{1.0, dist});
+                })
+                .reduceByKey((a, b) -> new double[]{a[0] + b[0], a[1] + b[1]})
+                .collectAsMap();
 
-    private static PartialResult mergePartial(PartialResult a, PartialResult b) {
-        int k = a.sums().length, d = a.sums()[0].length;
-        double[][] sums = new double[k][d];
-        long[] counts = new long[k];
-        for (int c = 0; c < k; c++) {
-            counts[c] = a.counts()[c] + b.counts()[c];
-            for (int dim = 0; dim < d; dim++)
-                sums[c][dim] = a.sums()[c][dim] + b.sums()[c][dim];
-        }
-        return new PartialResult(sums, counts);
-    }
-
-    private static KMeansResult evaluate(double[][] points, CsvDataset dataset, double[][] centroids, int iterations, int threshold) {
-        int k = centroids.length;
-
-        EvalResult result = ForkJoinPool.commonPool()
-            .invoke(new EvalTask(points, 0, points.length, centroids, threshold, k));
-
-        return new KMeansResult(copy(centroids), dataset.featureNames(), result.sizes(), iterations, result.sse());
-    }
-
-    private static class EvalTask extends RecursiveTask<EvalResult> {
-        private final double[][] points;
-        private final double[][] centroids;
-        private final int from, to, threshold, k;
-
-        EvalTask(double[][] points, int from, int to, double[][] centroids, int threshold, int k) {
-            this.points = points;
-            this.from = from;
-            this.to = to;
-            this.centroids = centroids;
-            this.threshold = threshold;
-            this.k = k;
+        long[] clusterSizes = new long[k];
+        double sse = 0;
+        for (Map.Entry<Integer, double[]> e : evalMap.entrySet()) {
+            clusterSizes[e.getKey()] = (long) e.getValue()[0];
+            sse += e.getValue()[1];
         }
 
-        @Override
-        protected EvalResult compute() {
-            if (to - from <= threshold) {
-                return evaluateChunk(points, from, to, centroids, k);
-            }
-            int mid = (from + to) / 2;
-            EvalTask left  = new EvalTask(points, from, mid, centroids, threshold, k);
-            EvalTask right = new EvalTask(points, mid,  to,  centroids, threshold, k);
-            left.fork();
-            EvalResult rightResult = right.compute();
-            EvalResult leftResult  = left.join();
-            return mergeEval(leftResult, rightResult);
+        spark.stop();
+        return new KMeansResult(centroids, featureNames, clusterSizes, completedIterations, sse);
+    }
+
+    private static double[] toDoubleArray(Row row, int d) {
+        double[] point = new double[d];
+        for (int i = 0; i < d; i++) {
+            Object val = row.get(i);
+            point[i] = val instanceof Number ? ((Number) val).doubleValue()
+                                             : Double.parseDouble(val.toString());
         }
+        return point;
     }
 
-    private static EvalResult evaluateChunk(double[][] points, int from, int to, double[][] centroids, int k) {
-        long[] sizes = new long[k];
-        double sse = 0.0;
-
-        for (int i = from; i < to; i++) {
-            int c = closestCentroid(points[i], centroids);
-            sizes[c]++;
-            sse += squaredDistance(points[i], centroids[c]);
-        }
-
-        return new EvalResult(sizes, sse);
-    }
-
-    private static EvalResult mergeEval(EvalResult a, EvalResult b) {
-        int k = a.sizes().length;
-        long[] sizes = new long[k];
-        for (int c = 0; c < k; c++)
-            sizes[c] = a.sizes()[c] + b.sizes()[c];
-        return new EvalResult(sizes, a.sse() + b.sse());
-    }
-
-    private record EvalResult(long[] sizes, double sse) {}
-
-    private record PartialResult(double[][] sums, long[] counts) {}
-
-    private static double[][] recomputeCentroids(double[][] currentCentroids, double[][] sums, long[] counts) {
-        double[][] updated = new double[currentCentroids.length][currentCentroids[0].length];
-
-        for (int cluster = 0; cluster < currentCentroids.length; cluster++) {
-            if (counts[cluster] == 0) {
-                updated[cluster] = currentCentroids[cluster].clone();
-                continue;
-            }
-
-            updated[cluster] = new double[currentCentroids[cluster].length];
-            for (int dimension = 0; dimension < currentCentroids[cluster].length; dimension++)
-                updated[cluster][dimension] = sums[cluster][dimension] / counts[cluster];
-        }
-
-        return updated;
-    }
-
-    static int closestCentroid(double[] point, double[][] centroids) {
-        int bestIndex = 0;
-        double bestDistance = squaredDistance(point, centroids[0]);
-
+    private static int closestCentroid(double[] point, double[][] centroids) {
+        int best = 0;
+        double bestDist = squaredDistance(point, centroids[0]);
         for (int i = 1; i < centroids.length; i++) {
-            double distance = squaredDistance(point, centroids[i]);
-            if (distance < bestDistance) {
-                bestDistance = distance;
-                bestIndex = i;
-            }
+            double dist = squaredDistance(point, centroids[i]);
+            if (dist < bestDist) { bestDist = dist; best = i; }
         }
-
-        return bestIndex;
+        return best;
     }
 
-    static double squaredDistance(double[] left, double[] right) {
-        double total = 0.0d;
-        for (int i = 0; i < left.length; i++) {
-            double delta = left[i] - right[i];
-            total += delta * delta;
+    private static double squaredDistance(double[] a, double[] b) {
+        double total = 0;
+        for (int i = 0; i < a.length; i++) {
+            double diff = a[i] - b[i];
+            total += diff * diff;
         }
         return total;
     }
 
-    private static void addPoint(double[] accumulator, double[] point) {
-        for (int i = 0; i < accumulator.length; i++)
-            accumulator[i] += point[i];
-    }
-
-    private static double maxShift(double[][] current, double[][] updated) {
-        double maxShift = 0.0d;
-        for (int i = 0; i < current.length; i++)
-            maxShift = Math.max(maxShift, squaredDistance(current[i], updated[i]));
-        return maxShift;
-    }
-
-    private static double[][] copy(double[][] centroids) {
-        double[][] copy = new double[centroids.length][];
-        for (int i = 0; i < centroids.length; i++)
-            copy[i] = centroids[i].clone();
+    private static double[][] copy(double[][] arr) {
+        double[][] copy = new double[arr.length][];
+        for (int i = 0; i < arr.length; i++) copy[i] = arr[i].clone();
         return copy;
+    }
+
+    private static double maxShift(double[][] a, double[][] b) {
+        double max = 0;
+        for (int i = 0; i < a.length; i++) max = Math.max(max, squaredDistance(a[i], b[i]));
+        return max;
     }
 }
